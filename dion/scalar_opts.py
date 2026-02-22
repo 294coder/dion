@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from typing import Generator, List
+from collections.abc import Generator
 
 
 @torch.compile(fullgraph=True)
@@ -27,7 +27,7 @@ def adamw_update(
     # M = beta1 * M + (1 - beta1) * G
     M.lerp_(G.to(M.dtype), 1 - beta1)
     # V = beta2 * V + (1 - beta2) * G * G
-    V.mul_(beta2).addcmul_(G, G, value=1 - beta2)
+    V.mul_(beta2).addcmul_(G, G, value=1 - beta2)  # type: ignore[arg-type]
 
     # Bias correction
     bias_correction1 = 1 - beta1**step
@@ -61,7 +61,7 @@ def adamw_update(
 
     # Weight update
     # X = X - adj_lr * M / denom
-    X.addcdiv_(M, denom, value=-adj_lr)
+    X.addcdiv_(M, denom, value=-adj_lr)  # type: ignore[arg-type]
 
 
 @torch.compile(fullgraph=True)
@@ -104,22 +104,23 @@ def lion_update(
 
     # Weight update
     # X = X - lr * U
-    X.add_(U, alpha=-lr)
+    X.add_(U, alpha=-lr)  # type: ignore[arg-type]
 
 
 @torch.compile(fullgraph=True)
 def adamw_update_foreach(
-    X: List[Tensor],  # Model weights (modified in place)
-    G: List[Tensor],  # Gradient
-    M: List[Tensor],  # Momentum buffer (modified in place)
-    V: List[Tensor],  # Variance buffer (modified in place)
+    X: list[Tensor],  # Model weights (modified in place)
+    G: list[Tensor],  # Gradient
+    M: list[Tensor],  # Momentum buffer (modified in place)
+    V: list[Tensor],  # Variance buffer (modified in place)
     lr: Tensor,  # Learning rate (scalar tensor)
     beta1: Tensor,  # Beta 1 (scalar tensor)
     beta2: Tensor,  # Beta 2 (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
-    step: int,
-    epsilon: float,
+    step: Tensor,
+    epsilon: Tensor,
     cautious_wd: bool = False,
+    mask_scales: Tensor | None = None,
 ):
     """
     AdamW optimizer algorithm (foreach implementation).
@@ -128,6 +129,11 @@ def adamw_update_foreach(
     assert batch_size == len(G)
     assert batch_size == len(M)
     assert batch_size == len(V)
+    if mask_scales is None:
+        mask_scales = torch.ones(batch_size, device=X[0].device, dtype=torch.float32)
+    assert mask_scales.ndim == 1
+    assert batch_size == int(mask_scales.numel())
+    per_param_scales = tuple(mask_scales.unbind())
 
     M_dtype = M[0].dtype
     V_dtype = V[0].dtype
@@ -183,19 +189,21 @@ def adamw_update_foreach(
     # Weight update
     # X = X - adj_lr * M / denom
     torch._foreach_mul_(M_div, adj_lr)
+    torch._foreach_mul_(M_div, per_param_scales)
     torch._foreach_sub_(X, M_div)
 
 
 @torch.compile(fullgraph=True)
 def lion_update_foreach(
-    X: List[Tensor],  # Model weights (modified in place)
-    G: List[Tensor],  # Gradient
-    M: List[Tensor],  # Momentum buffer (modified in place)
+    X: list[Tensor],  # Model weights (modified in place)
+    G: list[Tensor],  # Gradient
+    M: list[Tensor],  # Momentum buffer (modified in place)
     lr: Tensor,  # Learning rate (scalar tensor)
     beta1: Tensor,  # Beta 1 (scalar tensor)
     beta2: Tensor,  # Beta 2 (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     cautious_wd: bool = False,
+    mask_scales: Tensor | None = None,
 ):
     """
     Lion optimizer algorithm (foreach implementation).
@@ -203,7 +211,15 @@ def lion_update_foreach(
     batch_size = len(X)
     assert batch_size == len(G)
     assert batch_size == len(M)
+    if mask_scales is None:
+        mask_scales = torch.ones(batch_size, device=X[0].device, dtype=torch.float32)
+    assert mask_scales.ndim == 1
+    assert batch_size == int(mask_scales.numel())
+    per_param_scales = tuple(mask_scales.unbind())
 
+    # 不能用 `M[0].dtype` 作为全局 dtype：参数/动量 buffer 可能混合 float32/float64；
+    # foreach API 允许列表中不同 dtype 的 tensor，但要求每对 (start, end) dtype 一致。
+    # G = [g.to(dtype=m.dtype) for g, m in zip(G, M, strict=True)]
     dtype = M[0].dtype
     G = [g.to(dtype=dtype) for g in G]
 
@@ -236,37 +252,42 @@ def lion_update_foreach(
     # Weight update
     # X = X - lr * U
     torch._foreach_mul_(U, lr)
+    torch._foreach_mul_(U, per_param_scales)
     torch._foreach_sub_(X, U)
 
 
 def adamw_update_foreach_async(
-    X: List[Tensor],
-    G: List[Tensor],
-    M: List[Tensor],
-    V: List[Tensor],
+    X: list[Tensor],
+    G: list[Tensor],
+    M: list[Tensor],
+    V: list[Tensor],
     lr: Tensor,
     beta1: Tensor,
     beta2: Tensor,
     weight_decay: Tensor,
-    step: int,
-    epsilon: float,
+    step: Tensor,
+    epsilon: Tensor,
     cautious_wd: bool = False,
+    mask_scales: Tensor | None = None,
 ) -> Generator[None, None, None]:
-    adamw_update_foreach(
-        X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd
-    )
+    if mask_scales is None:
+        mask_scales = torch.ones(len(X), device=X[0].device, dtype=torch.float32)
+    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon, cautious_wd, mask_scales)
     yield
 
 
 def lion_update_foreach_async(
-    X: List[Tensor],
-    G: List[Tensor],
-    M: List[Tensor],
+    X: list[Tensor],
+    G: list[Tensor],
+    M: list[Tensor],
     lr: Tensor,
     beta1: Tensor,
     beta2: Tensor,
     weight_decay: Tensor,
     cautious_wd: bool = False,
+    mask_scales: Tensor | None = None,
 ) -> Generator[None, None, None]:
-    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay, cautious_wd)
+    if mask_scales is None:
+        mask_scales = torch.ones(len(X), device=X[0].device, dtype=torch.float32)
+    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay, cautious_wd, mask_scales)
     yield
