@@ -3,7 +3,7 @@
 This repository provides efficient implementations of orthonormal optimizers for distributed ML training.
 You can find the following optimizers:
 * [Muon](https://kellerjordan.github.io/posts/muon/)
-* [Dion2](https://arxiv.org/abs/2512.16928) and [Dion](https://arxiv.org/pdf/2504.05295) (Dion is a legacy optimizer; we recommend using Dion2)
+* [Dion2/Dion3](https://arxiv.org/abs/2608.11612) and [Dion](https://arxiv.org/pdf/2504.05295) (Dion is a legacy optimizer; we recommend using Dion2 or Dion3)
 * [NorMuon](https://arxiv.org/abs/2510.05491) 
 
 
@@ -55,7 +55,7 @@ pip install git+https://github.com/microsoft/dion.git
 Then in your code, you can use:
 
 ```python
-from dion import Dion2, Muon, NorMuon, Dion
+from dion import Dion2, Dion3, Muon, NorMuon, Dion
 ```
 
 Please carefully go through this readme for detailed instructions on using our optimizers. There are major differences compared to PyTorch built-in optimizers, such as `Adam`/`AdamW`.
@@ -82,6 +82,8 @@ To train a GPT-small model using Dion2 with 4 GPUs (adjust as needed for your se
 torchrun --standalone --nproc_per_node=4 train.py --config configs/dion2_160m.yaml
 ```
 This will launch Distributed Data Parallel (DDP) training.
+
+To train with Dion3 instead, swap in `configs/dion3_160m.yaml`. Its hyperparameters are carried over from the Dion2 config as a starting point rather than a translation — Dion3's per-neuron normalization redistributes the update across rows, and `mu` feeds Dion2's error-feedback decay but Dion3's momentum — so read the comments in the file before tuning. The FSDP and HSDP examples below accept it as well; tensor parallelism does not (see below).
 
 ### Distributed Training: FSDP / TP / Hybrid Sharding
 
@@ -142,19 +144,19 @@ Optimization algorithms are essential to training neural networks, converting gr
 
 The practical effectiveness of orthonormal optimizers was first demonstrated by [Muon](https://kellerjordan.github.io/posts/muon/) in the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has since been validated at scale by models such as [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon implements orthonormalization via *Newton-Schulz iterations*, which relies on repeated matrix-matrix multiplications. However, large-scale training relies on model sharding, where weight matrices and optimizer states are distributed across multiple processes. As discussed by [Essential AI](https://www.essential.ai/blog/infra), orthonormalizing a sharded matrix with Newton-Schulz iterations involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
 
-**Dion/Dion2** are our methods for building a **scalable, communication-efficient** optimizer. Like Muon, they compute matrix weight updates based on matrix orthonormalization and share similar practical benefits. The key difference is that Dion and Dion2 **shirnk the matrix before orthonormalization**, reducing both computational and communication costs. Dion uses power iteration to compute a low-rank approximation, while Dion2 applies a simple submatrix-selection procedure. To reduce information loss, both methods include an error-feedback mechanism that tracks the discrepancy between the original matrix and its compressed approximation.
+**Dion, Dion2, and Dion3** are our methods for building a **scalable, communication-efficient** optimizer. Like Muon, they compute matrix weight updates based on matrix orthonormalization and share similar practical benefits. The key difference is that they **shrink the matrix before orthonormalization**, reducing both computational and communication costs. Dion uses power iteration to compute a low-rank approximation, Dion2 applies a simple submatrix-selection procedure, and Dion3 combines Dion2's selection with NorMuon's per-neuron normalization. To reduce information loss, all of them include an error-feedback mechanism that tracks the discrepancy between the original matrix and its compressed approximation.
 
 
 ## Optimizers
 
 Our current implementations support the following parallelization techniques:
 
-| Parallelization    | Dion | Dion2 | Muon | NorMuon |
-|--------------------|------|-------|------|---------| 
-| Single device      | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch DDP        | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2      | Yes  |  Yes  | Yes  |   Yes   |
-| PyTorch FSDP2 + TP | Yes  |  No   | No   |   No    |
+| Parallelization    | Dion | Dion2 | Dion3 | Muon | NorMuon |
+|--------------------|------|-------|-------|------|---------|
+| Single device      | Yes  |  Yes  |  Yes  | Yes  |   Yes   |
+| PyTorch DDP        | Yes  |  Yes  |  Yes  | Yes  |   Yes   |
+| PyTorch FSDP2      | Yes  |  Yes  |  Yes  | Yes  |   Yes   |
+| PyTorch FSDP2 + TP | Yes  |  No   |  No   | No   |   No    |
 
 For faster performance, these optimizers will process parameters in batches and interleave multiple batches to overlap compute with communication.
 
@@ -250,7 +252,7 @@ param_groups = [
 
 Attention Q / K / V / gate projections are typically stored as a single 2D `nn.Linear` weight of shape `(num_heads * head_dim, in_features)`, but semantically each head is an independent `(head_dim, in_features)` matrix. Orthogonalizing the fused matrix blends information across heads — often not what you want.
 
-You can ask Dion2, Muon, or NorMuon to run Newton-Schulz independently per head without changing the model layout by setting `num_heads` on the parameter group:
+You can ask Dion2, Dion3, Muon, or NorMuon to run Newton-Schulz independently per head without changing the model layout by setting `num_heads` on the parameter group:
 
 ```python
 param_groups = [
@@ -285,9 +287,9 @@ Requirements: the parameter must be 2D, `split_sizes` must sum to dim 0, and wit
 
 For our efficient distributed optimizers to work correctly, they need information about the model's parallelization scheme. This is provided by passing `DeviceMesh` objects during optimizer construction.
 
-### 1D Sharding Configuration (Dion2, Muon, NorMuon)
+### 1D Sharding Configuration (Dion2, Dion3, Muon, NorMuon)
 
-Most optimizers in this codebase (Dion2, Muon, NorMuon) currently support only 1D sharding. They accept a single 1D device mesh via the `distributed_mesh` argument and adapt their behavior based on how this mesh is used:
+Most optimizers in this codebase (Dion2, Dion3, Muon, NorMuon) currently support only 1D sharding. They accept a single 1D device mesh via the `distributed_mesh` argument and adapt their behavior based on how this mesh is used:
 
 - **If the mesh is used for parameter sharding**: The optimizer efficiently unshards parameters using all-to-all communication
 - **If the mesh is not used for sharding**: The optimizer distributes work across devices and all-gathers the final results
@@ -380,7 +382,7 @@ optimizer = Dion(
 
 ## Best Practices
 
-* **Dion/Dion2 rank fraction:** The most important Dion-specific hyperparameter is the *rank fraction*, which controls the amount of low-rank compression. Setting `rank_fraction=1.0` resulting in full-rank updates without any compression, similar to Muon. Empirically, it appears that larger models are more tolerant of low-rank compression. At 3B parameters, `rank_fraction=0.25` (1/4 rank) achieves nearly equivalent performance as full-rank, and we expect that 1/8, 1/16, and perhaps lower rank fractions will work well at 10B+ scale.
+* **Dion/Dion2/Dion3 rank fraction:** The most important Dion-specific hyperparameter is the *rank fraction*, which controls the amount of low-rank compression. Setting `rank_fraction=1.0` resulting in full-rank updates without any compression, similar to Muon. Empirically, it appears that larger models are more tolerant of low-rank compression. At 3B parameters, `rank_fraction=0.25` (1/4 rank) achieves nearly equivalent performance as full-rank, and we expect that 1/8, 1/16, and perhaps lower rank fractions will work well at 10B+ scale.
 * **2D sharding:** If weights are sharded with both FSDP and TP, it is required that the sharding methods are applied to different matrix dimensions. The TP sharding dimension is controlled via `RowwiseParallel` and `ColwiseParallel`, but the FSDP sharding dimension needs to be manually specified when applied on top of TP. See `models/gpt_model.py` for an example of explicitly providing `fully_shard()` with per-parameter shard dimensions. Double-sharded matrices along the same dimension will raise an error in Dion.
 * **Learning rate scaling:** Dion will automatically scale the provided learning rate by `sqrt(d_out / d_in)` for matrix parameters. Muon will apply the same scaling by default, but also supports the `0.2 * sqrt(max(d_in, d_out))` scale factor recommended by Moonshot AI. Our default scale factor is intended to induce a consistent change to activation vector values, which enables learning rate transfer across model size. See [Deriving Muon](https://jeremybernste.in/writing/deriving-muon) for more information.
 * **Nesterov momentum:** In Muon, we set Nesterov momentum to `False` by default, as we observed better performance without it. Dion does not implement Nesterov momentum.
@@ -531,14 +533,15 @@ Triton kernels can be enabled in Muon with the option `use_triton=True`. Note th
 
 # Citation 
 
-If you use Dion/Dion2 in your research, please cite:
+If you use Dion/Dion2/Dion3 in your research, please cite:
 
 ```bash
-@article{ahn2025dion2,
-  title={Dion2: A Simple Method to Shrink Matrix in Muon},
-  author={Ahn, Kwangjun and Amsel, Noah and Langford, John},
-  journal={arXiv preprint 2512.16928},
-  year={2025}
+@article{amsel2026dion3,
+  title={Dion3: Full-Stack Orthogonal Updates},
+  author={Amsel, Noah and Zhang, Jack and Ahn, Kwangjun and Naeimi, Ali and Feng, Austin and Chen, Berlin and Dao, Tri and Langford, John},
+  journal={arXiv preprint arXiv:2608.11612},
+  year={2026},
+  url={https://arxiv.org/abs/2608.11612}
 }
 ``` 
 

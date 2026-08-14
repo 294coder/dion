@@ -1,0 +1,50 @@
+
+# — Model —
+model_dim: 768
+n_layer: 12
+n_head: 6
+sequence_length: 1024
+
+# — Batching & Training —
+batch_size: 1024
+device_batch_size: 32
+num_iterations: 3000
+
+# — Learning‐rate schedule —
+warmup_ratio: 0.0
+warmdown_ratio: 0.2
+
+# — Validation & Checkpointing —
+val_loss_every: 125
+val_tokens: 10485760
+
+# — Weights & Biases logging —
+wandb_project_name: gpt-train
+wandb_job_name: null
+no_wandb: false
+
+# — Miscellaneous flags —
+debug: false
+no_compile: false
+no_triton: false
+
+# — Distributed training —
+dp_size: null      # data‐parallel size
+fs_size: null      # FSDP size
+
+# — Optimizer & Hyperparameters —
+# These values are carried over from dion2_160m.yaml as a starting point, not
+# as a translation. Dion3 (NorDion2) normalizes per neuron, and the rescale that
+# follows preserves the update's Frobenius norm, not the spectral norm that
+# adjust_lr: spectral_norm assumes -- so the same total step is redistributed
+# across rows and the best lr need not be Dion2's. Note also that train.py feeds
+# mu to Dion2 as ef_decay (error-feedback decay) but to Dion3 as mu (momentum),
+# and that Dion3's second-moment muon_beta2 is fixed at 0.95 in train.py with no
+# key here. Retune rather than assuming parity with the Dion2 config.
+optimizer: dion3
+scalar_opt: adamw
+mu: 0.95
+weight_decay: 0.01
+ortho_fraction: 0.5
+adjust_lr: spectral_norm
+lr: 0.02
