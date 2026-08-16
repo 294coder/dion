@@ -153,7 +153,7 @@ class NorDion2(DistributedOrthoBase):
         if algorithm == self._algo_name:
             expected["variance_neuron"] = (
                 parameter.shape[:-1] + (1,),
-                to_local(parameter).shape[:-1] + (1,),
+                expected["momentum"][1][:-1] + (1,),
                 parameter.dtype,
                 isinstance(parameter, DTensor),
             )
@@ -163,20 +163,6 @@ class NorDion2(DistributedOrthoBase):
         expected = super()._expected_state_fields(algorithm)
         if algorithm == self._algo_name:
             expected.add("variance_neuron")
-        return expected
-
-    def _expected_state_metadata(
-        self,
-        parameter: Tensor,
-        algorithm: str,
-    ) -> dict[str, tuple[torch.Size, torch.dtype, bool]]:
-        expected = super()._expected_state_metadata(parameter, algorithm)
-        if algorithm == self._algo_name:
-            expected["variance_neuron"] = (
-                parameter.shape[:-1] + (1,),
-                parameter.dtype,
-                isinstance(parameter, DTensor),
-            )
         return expected
 
     def _get_shard_info(self, param: Tensor, group: dict):

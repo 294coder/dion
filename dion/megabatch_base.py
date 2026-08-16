@@ -236,31 +236,6 @@ class DistributedOrthoBase(Optimizer):
             return {"momentum", "variance", "step_dev"}
         raise RuntimeError(f"Unsupported optimizer state algorithm {algorithm!r}.")
 
-    def _expected_state_metadata(
-        self,
-        parameter: Tensor,
-        algorithm: str,
-    ) -> dict[str, tuple[torch.Size, torch.dtype, bool]]:
-        distributed = isinstance(parameter, DTensor)
-        if algorithm == self._algo_name or algorithm == "lion":
-            expected = {
-                "momentum": (parameter.shape, parameter.dtype, distributed),
-            }
-            if algorithm == "normuon":
-                expected["variance_neuron"] = (
-                    parameter.shape[:-1] + (1,),
-                    parameter.dtype,
-                    distributed,
-                )
-            return expected
-        if algorithm == "adamw":
-            return {
-                "momentum": (parameter.shape, parameter.dtype, distributed),
-                "variance": (parameter.shape, parameter.dtype, distributed),
-                "step_dev": (torch.Size([]), torch.float32, False),
-            }
-        raise RuntimeError(f"Unsupported optimizer state algorithm {algorithm!r}.")
-
     def _validate_state_entry(
         self,
         parameter: Tensor,
@@ -270,6 +245,10 @@ class DistributedOrthoBase(Optimizer):
         validate_device: bool,
         allow_legacy_adamw_step: bool = False,
     ) -> None:
+        if not isinstance(state, dict):
+            raise RuntimeError(
+                f"Invalid optimizer state entry for algorithm {algorithm!r}: expected dict."
+            )
         expected = self._expected_state_shapes(parameter, algorithm)
         expected_fields = set(expected)
         if allow_legacy_adamw_step and algorithm == "adamw":
@@ -280,7 +259,6 @@ class DistributedOrthoBase(Optimizer):
                 f"expected {sorted(expected)}, got {sorted(state)}."
             )
 
-        parameter_local = to_local(parameter)
         for name, (global_shape, local_shape, dtype, distributed) in expected.items():
             if name not in state:
                 continue
@@ -298,6 +276,11 @@ class DistributedOrthoBase(Optimizer):
                     f"Invalid optimizer state {algorithm}.{name}: expected shape {tuple(global_shape)} and "
                     f"dtype {dtype}, got shape {tuple(value.shape)} and dtype {value.dtype}."
                 )
+            if validate_device and value.device != parameter.device:
+                raise RuntimeError(
+                    f"Invalid optimizer state {algorithm}.{name}: expected device {parameter.device}, "
+                    f"got {value.device}."
+                )
 
             value_local = to_local(value)
             if value_local.shape != local_shape:
@@ -305,15 +288,30 @@ class DistributedOrthoBase(Optimizer):
                     f"Invalid optimizer state {algorithm}.{name}: expected local shape {tuple(local_shape)}, "
                     f"got {tuple(value_local.shape)}."
                 )
-            if validate_device and value_local.device != parameter_local.device:
+            if validate_device and value_local.device != parameter.device:
                 raise RuntimeError(
-                    f"Invalid optimizer state {algorithm}.{name}: expected device {parameter_local.device}, "
+                    f"Invalid optimizer state {algorithm}.{name}: expected device {parameter.device}, "
                     f"got {value_local.device}."
                 )
-            if distributed and (value.placements != parameter.placements or value.device_mesh != parameter.device_mesh):
-                raise RuntimeError(
-                    f"Invalid optimizer state {algorithm}.{name}: DTensor mesh or placements do not match the parameter."
+            if distributed:
+                parameter_group_names = tuple(
+                    parameter.device_mesh.get_group(mesh_dim).group_name
+                    for mesh_dim in range(parameter.device_mesh.ndim)
                 )
+                value_group_names = tuple(
+                    value.device_mesh.get_group(mesh_dim).group_name
+                    for mesh_dim in range(value.device_mesh.ndim)
+                )
+                if value_group_names != parameter_group_names:
+                    raise RuntimeError(
+                        f"Invalid optimizer state {algorithm}.{name}: "
+                        "DTensor device mesh does not match the parameter."
+                    )
+                if value.placements != parameter.placements:
+                    raise RuntimeError(
+                        f"Invalid optimizer state {algorithm}.{name}: "
+                        "DTensor placements do not match the parameter."
+                    )
 
     def _validate_materialized_state(self) -> None:
         parameters, algorithms, expected_cache_keys = self._validate_materialized_structure()
@@ -348,17 +346,11 @@ class DistributedOrthoBase(Optimizer):
     def _validate_materialized_structure(
         self,
     ) -> tuple[dict[int, Tensor], dict[int, str], set[tuple[int, str]]]:
+        expected_cache_keys = self._validate_group_cache_structure()
         parameters: dict[int, Tensor] = {}
         algorithms: dict[int, str] = {}
-        for group_index, group in enumerate(self.param_groups):
+        for group in self.param_groups:
             group_parameters = group["params"]
-            step = group.get("step")
-            if (
-                isinstance(step, bool)
-                or not isinstance(step, int)
-                or not 0 <= step <= torch.iinfo(torch.int64).max
-            ):
-                raise RuntimeError(f"Invalid optimizer state: parameter group {group_index} has invalid step {step!r}.")
             algorithm = group.get("algorithm")
             for parameter in group_parameters:
                 parameter_id = id(parameter)
@@ -378,81 +370,74 @@ class DistributedOrthoBase(Optimizer):
                 "parameter-group identities "
                 f"(missing={missing_count}, orphan={orphan_count})."
             )
-        for parameter_id, parameter in parameters.items():
-            algorithm = algorithms[parameter_id]
-            state = self.state[parameter]
-            if not isinstance(state, dict):
-                raise RuntimeError(
-                    f"Invalid optimizer state entry for algorithm {algorithm!r}: expected dict."
-                )
-            expected_fields = self._expected_state_fields(algorithm)
-            if set(state) != expected_fields:
-                raise RuntimeError(
-                    f"Invalid optimizer state fields for algorithm {algorithm!r}: "
-                    f"expected {sorted(expected_fields)}, got {sorted(state)}."
-                )
-            expected_metadata = self._expected_state_metadata(parameter, algorithm)
-            parameter_local_device: torch.device | None = None
-            for name, value in state.items():
-                if not isinstance(value, Tensor):
-                    raise RuntimeError(
-                        f"Invalid optimizer state {algorithm}.{name}: "
-                        f"expected Tensor, got {type(value).__name__}."
-                    )
-                expected_shape, expected_dtype, distributed = expected_metadata[name]
-                if isinstance(value, DTensor) != distributed:
-                    raise RuntimeError(
-                        f"Invalid optimizer state {algorithm}.{name}: "
-                        "DTensor identity does not match the parameter."
-                    )
-                if value.shape != expected_shape:
-                    raise RuntimeError(
-                        f"Invalid optimizer state {algorithm}.{name}: "
-                        f"expected shape {tuple(expected_shape)}, got {tuple(value.shape)}."
-                    )
-                if value.dtype != expected_dtype:
-                    raise RuntimeError(
-                        f"Invalid optimizer state {algorithm}.{name}: "
-                        f"expected dtype {expected_dtype}, got {value.dtype}."
-                    )
-                if value.device != parameter.device:
-                    raise RuntimeError(
-                        f"Invalid optimizer state {algorithm}.{name}: "
-                        f"expected device {parameter.device}, got {value.device}."
-                    )
-                if distributed:
-                    if parameter_local_device is None:
-                        parameter_local_device = parameter.to_local().device
-                    value_local_device = value.to_local().device
-                    if value_local_device != parameter_local_device:
-                        raise RuntimeError(
-                            f"Invalid optimizer state {algorithm}.{name}: "
-                            f"expected local device {parameter_local_device}, "
-                            f"got {value_local_device}."
-                        )
-                    parameter_group_names = tuple(
-                        parameter.device_mesh.get_group(mesh_dim).group_name
-                        for mesh_dim in range(parameter.device_mesh.ndim)
-                    )
-                    value_group_names = tuple(
-                        value.device_mesh.get_group(mesh_dim).group_name
-                        for mesh_dim in range(value.device_mesh.ndim)
-                    )
-                    if value_group_names != parameter_group_names:
-                        raise RuntimeError(
-                            f"Invalid optimizer state {algorithm}.{name}: "
-                            "DTensor device mesh does not match the parameter."
-                        )
-                    if value.placements != parameter.placements:
-                        raise RuntimeError(
-                            f"Invalid optimizer state {algorithm}.{name}: "
-                            "DTensor placements do not match the parameter."
-                        )
+        return parameters, algorithms, expected_cache_keys
 
+    def _validate_live_hyperparameter_values(self) -> None:
+        for index, group in enumerate(self.param_groups):
+            names = self._live_hyperparams_by_group.get(index, ("lr",))
+            if isinstance(group.get("weight_decay"), Tensor) and "weight_decay" not in names:
+                names = (*names, "weight_decay")
+            for name in names:
+                value = group.get(name)
+                scalar: float | None
+                if isinstance(value, Tensor):
+                    if (
+                        isinstance(value, DTensor)
+                        or value.shape != torch.Size([])
+                        or value.dtype == torch.bool
+                        or value.is_complex()
+                    ):
+                        raise RuntimeError(
+                            f"Invalid optimizer state: parameter group {index} has invalid live hyperparameter {name}."
+                        )
+                    persistent = self._hyperparam_tensors.get((index, name))
+                    if value is persistent:
+                        if value.dtype != torch.float32 or (
+                            group["params"] and value.device != group["params"][0].device
+                        ):
+                            raise RuntimeError(
+                                f"Invalid optimizer state: parameter group {index} has invalid live hyperparameter {name}."
+                            )
+                        # Schedulers update this stable device scalar in place. Its identity
+                        # and metadata are the runtime contract: reading the value here would
+                        # synchronize every CUDA step and is forbidden during graph capture.
+                        continue
+                    if value.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                        scalar = None
+                    else:
+                        try:
+                            scalar = float(value)
+                        except (RuntimeError, TypeError, ValueError):
+                            raise RuntimeError(
+                                f"Invalid optimizer state: parameter group {index} has invalid live hyperparameter {name}."
+                            ) from None
+                elif isinstance(value, Real) and not isinstance(value, bool):
+                    scalar = float(value)
+                else:
+                    raise RuntimeError(
+                        f"Invalid optimizer state: parameter group {index} has invalid live hyperparameter {name}."
+                    )
+                if scalar is not None and (not math.isfinite(scalar) or scalar < 0.0):
+                    raise RuntimeError(
+                        f"Invalid optimizer state: parameter group {index} has invalid live hyperparameter {name}."
+                    )
+
+    def _validate_group_cache_structure(self) -> set[tuple[int, str]]:
         expected_cache_keys: set[tuple[int, str]] = set()
         if set(self._live_hyperparams_by_group) != set(range(len(self.param_groups))):
             raise RuntimeError("Invalid optimizer state: live hyperparameter groups are incomplete.")
+        self._validate_live_hyperparameter_values()
         for index, group in enumerate(self.param_groups):
+            step = group.get("step")
+            if (
+                isinstance(step, bool)
+                or not isinstance(step, int)
+                or not 0 <= step <= torch.iinfo(torch.int64).max
+            ):
+                raise RuntimeError(
+                    f"Invalid optimizer state: parameter group {index} has invalid step {step!r}."
+                )
+            self._expected_state_fields(group.get("algorithm"))
             names = self._live_hyperparams_by_group[index]
             if names not in (("lr",), ("lr", "weight_decay")):
                 raise RuntimeError(
@@ -478,7 +463,36 @@ class DistributedOrthoBase(Optimizer):
         if set(self._hyperparam_tensors) != expected_cache_keys:
             raise RuntimeError("Invalid optimizer state: hyperparameter cache keys do not match parameter groups.")
 
-        return parameters, algorithms, expected_cache_keys
+        return expected_cache_keys
+
+    def _validate_active_parameter_states(self) -> None:
+        active_algorithms: dict[int, str] = {}
+        for group in self.param_groups:
+            algorithm = group["algorithm"]
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                parameter_id = id(parameter)
+                if parameter_id in active_algorithms:
+                    if active_algorithms[parameter_id] != algorithm:
+                        raise RuntimeError(
+                            "Invalid optimizer state: one active parameter has multiple algorithms."
+                        )
+                    continue
+
+                state = self.state.get(parameter)
+                if state is None:
+                    raise RuntimeError(
+                        "Invalid optimizer state coverage: active parameter state is missing."
+                    )
+                self._validate_parameter_distribution(parameter, algorithm, group)
+                self._validate_state_entry(
+                    parameter,
+                    algorithm,
+                    state,
+                    validate_device=True,
+                )
+                active_algorithms[parameter_id] = algorithm
 
     def _validate_parameter_distribution(
         self,
@@ -577,7 +591,15 @@ class DistributedOrthoBase(Optimizer):
                         raise RuntimeError(
                             f"Invalid optimizer state_dict fraction for group {group_index}: {scalar!r}."
                         )
-                    if name in ("lr", "mu", "muon_beta2", "beta1", "beta2", "epsilon") and scalar < 0.0:
+                    if name in (
+                        "lr",
+                        "weight_decay",
+                        "mu",
+                        "muon_beta2",
+                        "beta1",
+                        "beta2",
+                        "epsilon",
+                    ) and scalar < 0.0:
                         raise RuntimeError(
                             f"Invalid optimizer state_dict scalar {name!r} for group {group_index}: {scalar!r}."
                         )
@@ -661,7 +683,7 @@ class DistributedOrthoBase(Optimizer):
                 "Optimizer state must be materialized successfully before step()."
             )
         try:
-            self._validate_materialized_structure()
+            self._validate_group_cache_structure()
         except Exception:
             self._state_lifecycle = "failed"
             raise
@@ -670,6 +692,12 @@ class DistributedOrthoBase(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        try:
+            self._validate_active_parameter_states()
+        except Exception:
+            self._state_lifecycle = "failed"
+            raise
 
         # The LR is carried as a device tensor the kernels read directly (see
         # _ensure_hyperparam_tensor); a scheduler updates it in place outside the graph and every

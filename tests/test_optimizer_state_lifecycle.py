@@ -140,11 +140,16 @@ def _invoke_entry(
         return target
 
     mutation(optimizer.state, parameters)
+    if entry == "step":
+        for parameter in parameters.values():
+            parameter.grad = torch.zeros_like(parameter)
     with pytest.raises(RuntimeError, match="optimizer state"):
         if entry == "step":
             optimizer.step()
         else:
             optimizer.state_dict()
+    if entry == "step":
+        assert all(group["step"] == 0 for group in optimizer.param_groups)
     return optimizer
 
 
@@ -203,6 +208,7 @@ def test_runtime_and_checkpoint_boundaries_reject_malformed_state_tensor(
         "step_range",
         "hyperparameter",
         "nonfinite_hyperparameter",
+        "negative_weight_decay",
         "missing_field",
         "collapsed_parameter_key",
     ],
@@ -225,6 +231,8 @@ def test_malformed_group_envelope_load_is_atomic_and_fails_closed(
         checkpoint["param_groups"][0]["lr"] = torch.ones(2)
     elif malformation == "nonfinite_hyperparameter":
         checkpoint["param_groups"][0]["weight_decay"] = float("nan")
+    elif malformation == "negative_weight_decay":
+        checkpoint["param_groups"][0]["weight_decay"] = -0.1
     elif malformation == "missing_field":
         del checkpoint["param_groups"][0]["epsilon"]
     else:
@@ -396,6 +404,8 @@ def test_load_post_hook_cannot_return_invalid_optimizer() -> None:
 def test_materialized_adamw_missing_step_dev_fails_closed(entry: str) -> None:
     optimizer, parameters = _make_optimizer()
     del optimizer.state[parameters["adamw"]]["step_dev"]
+    if entry == "step":
+        parameters["adamw"].grad = torch.zeros_like(parameters["adamw"])
 
     with pytest.raises(RuntimeError, match="step_dev"):
         if entry == "step":
@@ -473,23 +483,128 @@ def test_step_refreshes_reassigned_hyperparameter_before_optimizer_update() -> N
     assert cached_lr.item() == pytest.approx(0.1)
 
 
-def test_step_uses_fast_state_validation() -> None:
-    optimizer, _ = _make_optimizer()
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("lr", torch.ones(2)),
+        ("lr", object()),
+        ("lr", float("nan")),
+        ("lr", -0.1),
+        ("weight_decay", torch.ones(2)),
+        ("weight_decay", object()),
+        ("weight_decay", float("inf")),
+        ("weight_decay", -0.1),
+    ],
+)
+def test_step_rejects_invalid_live_hyperparameter_before_increment(
+    name: str,
+    value: object,
+) -> None:
+    if name == "weight_decay":
+        parameter = torch.nn.Parameter(torch.randn(8))
+        optimizer = NorDion2(
+            [
+                {
+                    "params": [parameter],
+                    "algorithm": "lion",
+                    "weight_decay": torch.tensor(0.01),
+                }
+            ]
+        )
+    else:
+        optimizer, _ = _make_optimizer()
+    optimizer.param_groups[0][name] = value
 
-    def reject_full_validation() -> None:
-        pytest.fail("step() must not run the full checkpoint validator")
+    with pytest.raises(RuntimeError, match="live hyperparameter"):
+        optimizer.step()
 
-    def reject_tensor_shape_validation(
+    assert all(group["step"] == 0 for group in optimizer.param_groups)
+    _assert_permanently_failed(optimizer)
+
+
+def test_step_strictly_validates_only_active_parameter_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inactive_parameters = [torch.nn.Parameter(torch.randn(8)) for _ in range(128)]
+    active_parameter = torch.nn.Parameter(torch.randn(8))
+    with pytest.warns(UserWarning, match="duplicate parameters"):
+        optimizer = NorDion2(
+            [
+                {
+                    "params": [*inactive_parameters, active_parameter, active_parameter],
+                    "algorithm": "lion",
+                }
+            ]
+        )
+    active_parameter.grad = torch.zeros_like(active_parameter)
+    validated_parameters: list[torch.Tensor] = []
+    runtime_validated_parameters: list[torch.Tensor] = []
+    original_validator = optimizer._validate_state_entry
+
+    def record_validation(
         parameter: torch.Tensor,
         algorithm: str,
-    ) -> dict:
-        pytest.fail(f"step() must not inspect full tensor schema for {algorithm} parameter {id(parameter)}")
+        state: dict,
+        *,
+        validate_device: bool,
+        allow_legacy_adamw_step: bool = False,
+    ) -> None:
+        validated_parameters.append(parameter)
+        original_validator(
+            parameter,
+            algorithm,
+            state,
+            validate_device=validate_device,
+            allow_legacy_adamw_step=allow_legacy_adamw_step,
+        )
 
-    optimizer._validate_materialized_state = reject_full_validation
-    optimizer._expected_state_shapes = reject_tensor_shape_validation
+    monkeypatch.setattr(optimizer, "_validate_state_entry", record_validation)
+    monkeypatch.setattr(
+        optimizer,
+        "_validate_state_runtime_metadata",
+        lambda parameter, algorithm, state: runtime_validated_parameters.append(parameter),
+        raising=False,
+    )
+    monkeypatch.setattr(optimizer, "_create_ortho_tasks", lambda groups: ())
+    monkeypatch.setattr(optimizer, "_create_lion_tasks", lambda groups: ())
+    monkeypatch.setattr(optimizer, "_create_adamw_tasks", lambda groups: ())
+    optimizer.step()
+
+    assert validated_parameters == [active_parameter]
+    assert runtime_validated_parameters == []
+    assert optimizer.param_groups[0]["step"] == 1
+
+
+def test_inactive_state_corruption_is_delayed_until_first_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    optimizer, parameters = _make_optimizer()
+    del optimizer.state[parameters["lion"]]["momentum"]
+    parameters["nordion2"].grad = torch.zeros_like(parameters["nordion2"])
+    monkeypatch.setattr(optimizer, "_create_ortho_tasks", lambda groups: ())
+    monkeypatch.setattr(optimizer, "_create_lion_tasks", lambda groups: ())
+    monkeypatch.setattr(optimizer, "_create_adamw_tasks", lambda groups: ())
+
     optimizer.step()
 
     assert all(group["step"] == 1 for group in optimizer.param_groups)
+    parameters["nordion2"].grad = None
+    parameters["lion"].grad = torch.zeros_like(parameters["lion"])
+    with pytest.raises(RuntimeError, match="optimizer state fields"):
+        optimizer.step()
+
+    assert all(group["step"] == 1 for group in optimizer.param_groups)
+    _assert_permanently_failed(optimizer)
+
+
+def test_inactive_state_corruption_is_rejected_by_state_dict() -> None:
+    optimizer, parameters = _make_optimizer()
+    del optimizer.state[parameters["lion"]]["momentum"]
+
+    with pytest.raises(RuntimeError, match="optimizer state fields"):
+        optimizer.state_dict()
+
+    _assert_permanently_failed(optimizer)
 
 
 @pytest.mark.parametrize("malformation", ["shape", "dtype", "device"])
@@ -517,6 +632,7 @@ def test_step_rejects_plain_state_device_corruption_before_increment() -> None:
         dtype=parameters["nordion2"].dtype,
         device="meta",
     )
+    parameters["nordion2"].grad = torch.zeros_like(parameters["nordion2"])
 
     with pytest.raises(RuntimeError, match="device"):
         optimizer.step()
@@ -576,6 +692,12 @@ def test_step_rejects_dtensor_mesh_corruption_before_increment(
     )
     optimizer._distributed_mesh = None
     optimizer._process_group = None
+    parameter.grad = DTensor.from_local(
+        torch.zeros_like(parameter.to_local()),
+        parameter_mesh,
+        [Replicate()],
+        run_check=False,
+    )
 
     with pytest.raises(RuntimeError, match="DeviceMesh"):
         optimizer.step()
@@ -645,12 +767,52 @@ def test_step_rejects_dtensor_state_runtime_metadata_before_increment(
     else:
         replacement = torch.zeros_like(local)
     optimizer.state[parameter]["momentum"] = replacement
+    parameter.grad = DTensor.from_local(
+        torch.zeros_like(local),
+        parameter_mesh,
+        [Replicate()],
+        run_check=False,
+    )
 
     with pytest.raises(RuntimeError, match=match):
         optimizer.step()
 
     assert optimizer.param_groups[0]["step"] == 0
     _assert_permanently_failed(optimizer)
+
+
+def test_step_accepts_equivalent_dtensor_state_mesh_group(
+    cpu_meshes: tuple[DeviceMesh, DeviceMesh],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameter_mesh, _ = cpu_meshes
+    equivalent_mesh = DeviceMesh.from_group(
+        parameter_mesh.get_group(),
+        "cpu",
+        mesh_dim_names=("equivalent",),
+    )
+    parameter = _make_dtensor_parameter(parameter_mesh, [Replicate()])
+    optimizer = NorDion2(
+        [{"params": [parameter], "algorithm": "nordion2"}],
+        distributed_mesh=parameter_mesh,
+    )
+    optimizer.state[parameter]["momentum"] = DTensor.from_local(
+        torch.zeros_like(parameter.to_local()),
+        equivalent_mesh,
+        [Replicate()],
+        run_check=False,
+    )
+    parameter.grad = DTensor.from_local(
+        torch.zeros_like(parameter.to_local()),
+        parameter_mesh,
+        [Replicate()],
+        run_check=False,
+    )
+    monkeypatch.setattr(optimizer, "_create_ortho_tasks", lambda groups: ())
+
+    optimizer.step()
+
+    assert optimizer.param_groups[0]["step"] == 1
 
 
 def test_load_rejects_dtensor_mesh_corruption_atomically(

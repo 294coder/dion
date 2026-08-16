@@ -749,6 +749,86 @@ def test_opting_in_to_a_live_weight_decay_after_capture_is_an_error():
     assert opt.param_groups[0]["weight_decay"] is opt._hyperparam_tensors[(0, "weight_decay")]
 
 
+def test_invalid_live_lr_fails_before_first_capture_or_sync():
+    params, opt = _build(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=1)
+    for parameter in params:
+        parameter.grad = torch.zeros_like(parameter)
+
+    wrap.step()
+    cached_lr = opt._hyperparam_tensors[(0, "lr")]
+    cached_value = cached_lr.clone()
+    step = opt.param_groups[0]["step"]
+    opt.param_groups[0]["lr"] = float("nan")
+
+    with pytest.raises(RuntimeError, match="live hyperparameter"):
+        wrap.step()
+
+    assert opt._state_lifecycle == "failed"
+    assert wrap._graph is None
+    assert wrap._step_count == 1
+    assert opt.param_groups[0]["step"] == step
+    torch.testing.assert_close(cached_lr, cached_value)
+
+
+def test_invalid_live_weight_decay_fails_before_replay_sync_or_host_step():
+    params, opt = _build_live_wd(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=1)
+    for parameter in params:
+        parameter.grad = torch.zeros_like(parameter)
+
+    wrap.step()
+    wrap.step()
+    assert wrap._graph is not None
+    cached_weight_decay = opt._hyperparam_tensors[(0, "weight_decay")]
+    cached_value = cached_weight_decay.clone()
+    step = opt.param_groups[0]["step"]
+    wrapper_step = wrap._step_count
+    opt.param_groups[0]["weight_decay"] = -0.1
+
+    with pytest.raises(RuntimeError, match="live hyperparameter"):
+        wrap.step()
+
+    assert opt._state_lifecycle == "failed"
+    assert wrap._step_count == wrapper_step
+    assert opt.param_groups[0]["step"] == step
+    torch.testing.assert_close(cached_weight_decay, cached_value)
+
+
+def test_steady_live_device_scalars_do_not_read_values_on_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params, opt = _build_live_wd(Dion2)
+    wrap = CudaGraphOptimizer(opt, warmup_steps=1)
+    for parameter in params:
+        parameter.grad = torch.zeros_like(parameter)
+
+    wrap.step()
+    original_float = torch.Tensor.__float__
+    original_item = torch.Tensor.item
+
+    def reject_cuda_float(value: torch.Tensor) -> float:
+        if value.is_cuda:
+            raise AssertionError("steady live CUDA tensors must not be converted to float")
+        return original_float(value)
+
+    def reject_cuda_item(value: torch.Tensor, *args) -> object:
+        if value.is_cuda:
+            raise AssertionError("steady live CUDA tensors must not call item()")
+        return original_item(value, *args)
+
+    monkeypatch.setattr(torch.Tensor, "__float__", reject_cuda_float)
+    monkeypatch.setattr(torch.Tensor, "item", reject_cuda_item)
+
+    wrap.step()
+    for group in opt.param_groups:
+        group["lr"].fill_(0.01)
+        group["weight_decay"].fill_(0.02)
+    wrap.step()
+
+    assert wrap._graph is not None
+
+
 def test_capture_refuses_a_parameter_without_a_gradient():
     params, opt = _build(Dion2)
     wrap = CudaGraphOptimizer(opt, warmup_steps=1)

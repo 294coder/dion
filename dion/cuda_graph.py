@@ -284,6 +284,20 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         if sync is not None:
             sync()
 
+    def _validate_live_hyperparams(self) -> None:
+        if getattr(self.optimizer, "_state_lifecycle", None) == "failed":
+            raise RuntimeError(
+                "Optimizer state materialization failed; rebuild the optimizer before CUDA graph replay."
+            )
+        validate = getattr(self.optimizer, "_validate_live_hyperparameter_values", None)
+        if validate is None:
+            return
+        try:
+            validate()
+        except Exception:
+            self.optimizer._state_lifecycle = "failed"
+            raise
+
     def step(self, closure: Optional[Callable] = None):
         # Automatic-optimization frameworks (Lightning) call step(closure); the closure runs
         # forward+backward, filling the stable .grad buffers the capture reads. Run it eagerly
@@ -297,6 +311,7 @@ class CudaGraphOptimizer(torch.optim.Optimizer):
         if self._step_count < self.warmup_steps:
             self.optimizer.step()
         else:
+            self._validate_live_hyperparams()
             self._sync_host_hyperparams()
             if self._graph is None:
                 # step() runs (and so does its host-side bookkeeping) while being traced.
