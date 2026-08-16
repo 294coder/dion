@@ -5,7 +5,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import ParamsT
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import Callable, Generator, List, Literal, Optional, Tuple, Union
 
 from .megabatch_base import (
     DistributedOrthoBase,
@@ -83,6 +83,7 @@ class NorDion2(DistributedOrthoBase):
         newton_schulz_func: Optional[Callable] = None,
         triton_post_ortho: bool = False,
         selection_scope: str = "local",
+        state_initialization: Literal["eager", "deferred"] = "eager",
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -125,6 +126,7 @@ class NorDion2(DistributedOrthoBase):
             use_triton=use_triton,
             use_polar_express=use_polar_express,
             newton_schulz_func=newton_schulz_func,
+            state_initialization=state_initialization,
         )
         if triton_post_ortho:
             from .dion2_triton import TRITON_AVAILABLE
@@ -142,6 +144,41 @@ class NorDion2(DistributedOrthoBase):
             state["variance_neuron"] = torch.zeros_like(param[..., 0:1])
         return state
 
+    def _expected_state_shapes(
+        self,
+        parameter: Tensor,
+        algorithm: str,
+    ) -> dict[str, tuple[torch.Size, torch.Size, torch.dtype, bool]]:
+        expected = super()._expected_state_shapes(parameter, algorithm)
+        if algorithm == self._algo_name:
+            expected["variance_neuron"] = (
+                parameter.shape[:-1] + (1,),
+                to_local(parameter).shape[:-1] + (1,),
+                parameter.dtype,
+                isinstance(parameter, DTensor),
+            )
+        return expected
+
+    def _expected_state_fields(self, algorithm: str) -> set[str]:
+        expected = super()._expected_state_fields(algorithm)
+        if algorithm == self._algo_name:
+            expected.add("variance_neuron")
+        return expected
+
+    def _expected_state_metadata(
+        self,
+        parameter: Tensor,
+        algorithm: str,
+    ) -> dict[str, tuple[torch.Size, torch.dtype, bool]]:
+        expected = super()._expected_state_metadata(parameter, algorithm)
+        if algorithm == self._algo_name:
+            expected["variance_neuron"] = (
+                parameter.shape[:-1] + (1,),
+                parameter.dtype,
+                isinstance(parameter, DTensor),
+            )
+        return expected
+
     def _get_shard_info(self, param: Tensor, group: dict):
         result = super()._get_shard_info(param, group)
         _, is_matrix_sharded, sharded_tensor_dim = result
@@ -151,6 +188,25 @@ class NorDion2(DistributedOrthoBase):
                 "Please avoid shards at dim -1."
             )
         return result
+
+    def _validate_parameter_distribution(
+        self,
+        parameter: Tensor,
+        algorithm: str,
+        group: dict,
+    ) -> None:
+        super()._validate_parameter_distribution(parameter, algorithm, group)
+        if (
+            algorithm == self._algo_name
+            and isinstance(parameter, DTensor)
+            and any(
+                placement.is_shard(parameter.ndim - 1)
+                for placement in parameter.placements
+            )
+        ):
+            raise NotImplementedError(
+                "NorDion2 currently does not support parameters sharded along the last dimension."
+            )
 
     def _create_ortho_tasks(
         self, param_groups: List[dict]
