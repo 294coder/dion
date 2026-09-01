@@ -43,6 +43,29 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- `NorDion2` / `Dion3` failed to compile on PyTorch 2.13 as soon as a model had more
+  than one parameter shape group (reported in #115).
+  `nordion2_normalize_selected_stacked` ran the gather of the selected variance rows,
+  the per-row reduction, and the scatter back into the full buffer in one compiled
+  graph; after automatic dynamic-shape generalization 2.13's inductor emitted the
+  scatter epilogue referencing a temp defined only inside the preceding `tl.range`
+  reduction body, and `optimizer.step()` raised `NameError: tmp19 is not defined`
+  (upstream pytorch/pytorch#194490, a 2.12 -> 2.13 regression; both use Triton 3.7.1).
+  Reproducing it takes a shape group holding at least two parameters — dynamo
+  specializes a batch dim of 1, so one-parameter groups stayed on the static path —
+  plus a second distinct row/column shape and a reduction long enough not to compile
+  as a persistent kernel. The scatter is now compiled as its own graph, which makes
+  the invalid fusion unreachable while keeping dynamic shapes; `dynamic=False` also
+  avoids it but recompiles per shape and hits the recompile limit (#23) past eight
+  shape groups. Where the fused form did compile it was also badly slower: its
+  generalized kernel measured ~60x the split one (68 ms vs 1.1 ms per call at N=8,
+  8192x2048 on an H100), so multi-shape models gain throughput here, while a model
+  with a single shape group pays one extra graph entry, ~40 us of host dispatch per
+  call. The split reassociates the fp32 reduction, so `U` differs from the fused
+  kernel by up to 1.9e-6 (`V` is bit-exact) — the same decomposition
+  `test_normalize_selected_stacked_matches_unfused` already compared at
+  `atol=rtol=1e-5`. `Dion2`, `NorMuon` and `Muon` were not affected.
+
 - `CudaGraphOptimizer.load_state_dict` named its parameter `sd`, so every distributed
   checkpoint resume raised `TypeError: got an unexpected keyword argument 'state_dict'`.
   torch's DCP calls it by keyword (`_load_optim_state_dict` does

@@ -506,7 +506,7 @@ def dion2_pre_orthogonalize(
     M_stacked = torch.stack(M, dim=0)
 
     # Compute L1 norm along norm_dim (sum of absolute values)
-    slice_norms = M_stacked.norm(p=1, dim=norm_dim)
+    slice_norms = M_stacked.abs().sum(dim=norm_dim)
 
     # Batched topk: indices shape (batch_size, k_topk). k_topk <= num_select is
     # guaranteed, so this never raises even on a short remainder shard.
@@ -600,7 +600,7 @@ def _make_select_and_orthogonalize(
         # k derives from the true global size but never exceeds the (padded)
         # matrix handed in, so topk is always valid.
         k = min(max(1, int(math.ceil(fraction * num_select))), X.size(select_dim))
-        slice_norms = X.norm(p=1, dim=norm_dim)
+        slice_norms = X.abs().sum(dim=norm_dim)
         _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
         if select_dim == -2:
             idx_exp = indices.unsqueeze(-1).expand(*indices.shape, X.size(-1))

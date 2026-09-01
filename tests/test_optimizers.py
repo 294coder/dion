@@ -9,6 +9,7 @@ Tests cover:
 - Step timing: optimizer step takes measurable wall-clock time
 """
 
+import math
 import os
 import pytest
 import time
@@ -51,6 +52,77 @@ def test_lm_head_lr_scale_by_scalar_opt(scalar_opt, expected_scale):
     from dion.opt_utils import lm_head_lr_scale
 
     assert lm_head_lr_scale(scalar_opt, model_dim=768) == pytest.approx(expected_scale)
+
+
+@pytest.mark.parametrize("selection_scope", ["local", "global"])
+def test_dion2_compiled_high_rank_l1_selection(selection_scope, monkeypatch):
+    from dion.dion2 import _make_select_and_orthogonalize, dion2_pre_orthogonalize
+
+    original_norm = torch.Tensor.norm
+
+    def _torch_211_l1_norm(
+        tensor,
+        p="fro",
+        dim=None,
+        keepdim=False,
+        dtype=None,
+    ):
+        if p == 1 and dim in (-1, -2) and dtype is None:
+            # Emulate the PyTorch 2.11 CUDA inductor bug: a stacked 5D input
+            # incorrectly retains the reduced dimension.
+            return tensor.abs().sum(dim=dim, keepdim=tensor.ndim == 5 or keepdim)
+        return original_norm(tensor, p=p, dim=dim, keepdim=keepdim, dtype=dtype)
+
+    monkeypatch.setattr(torch.Tensor, "norm", _torch_211_l1_norm)
+    torch.compiler.reset()
+    try:
+        for parameter_shape in [(2, 8), (2, 2, 8), (2, 2, 2, 8)]:
+            numel = math.prod(parameter_shape)
+            momentums = [
+                torch.arange(numel, dtype=torch.float32).reshape(parameter_shape) + offset
+                for offset in (1.0, 2.0)
+            ]
+            stacked = torch.stack(momentums)
+            assert stacked.ndim == len(parameter_shape) + 1
+            k = parameter_shape[-2] // 2
+            expected_indices = stacked.abs().sum(dim=-1).topk(k, dim=-1, sorted=False).indices
+            expanded_indices = expected_indices.unsqueeze(-1).expand(
+                *expected_indices.shape, parameter_shape[-1]
+            )
+            expected_selected = torch.gather(stacked, dim=-2, index=expanded_indices)
+
+            if selection_scope == "local":
+                selected, indices = dion2_pre_orthogonalize(
+                    G=[torch.zeros_like(momentum) for momentum in momentums],
+                    M=momentums,
+                    fraction=0.5,
+                    ef_decay=torch.tensor(1.0),
+                    select_dim=-2,
+                )
+                selected_stacked = torch.stack(selected)
+                assert selected_stacked.ndim == len(parameter_shape) + 1
+                torch.testing.assert_close(torch.stack(indices), expected_indices)
+                torch.testing.assert_close(
+                    selected_stacked,
+                    expected_selected.to(torch.bfloat16),
+                )
+            else:
+                select_and_orthogonalize = _make_select_and_orthogonalize(
+                    lambda tensor, epsilon=None: tensor,
+                    fraction=0.5,
+                    select_dim=-2,
+                )
+                selected = torch.compile(select_and_orthogonalize, fullgraph=True)(stacked)
+                assert selected.ndim == len(parameter_shape) + 1
+                torch.testing.assert_close(
+                    torch.gather(selected, dim=-2, index=expanded_indices),
+                    expected_selected,
+                )
+                expected = torch.zeros_like(stacked)
+                expected.scatter_(dim=-2, index=expanded_indices, src=expected_selected)
+                torch.testing.assert_close(selected, expected)
+    finally:
+        torch.compiler.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +341,75 @@ class TestNorDion2:
         # same fp tolerance as the sibling parity tests.
         torch.testing.assert_close(u_fused, u_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(v_fused, v_ref, atol=1e-5, rtol=1e-5)
+
+    def test_normalize_selected_stacked_multiple_shapes(self):
+        from dion.nordion2 import nordion2_normalize_selected_stacked
+        from dion.normuon import normuon_normalization_stacked
+
+        # A second distinct shape makes dynamo generalize to dynamic shapes.
+        # PyTorch 2.13's inductor miscompiled the gather/normalize/scatter graph
+        # there, emitting a scatter epilogue that reads a temp defined only
+        # inside the reduction loop body ("NameError: tmp19 is not defined").
+        # Two of these shapes are load-bearing and must not be shrunk, or the
+        # test silently stops covering the bug:
+        #   - cols must stay large, or the reduction compiles as a persistent
+        #     (non-looped) kernel and there is no loop body to leak a temp from;
+        #   - n must stay >= 2, or dynamo specializes the batch dim on 1 and
+        #     never generalizes the graph.
+        # The dynamo config is pinned so a profile cached by an earlier process
+        # (PGO persists across runs under the inductor cache dir) cannot skip
+        # the dynamic-shape path this test exists to cover.
+        # See https://github.com/pytorch/pytorch/issues/194490
+        pinned = {"automatic_dynamic_shapes": True}
+        if hasattr(torch._dynamo.config, "automatic_dynamic_local_pgo"):
+            pinned["automatic_dynamic_local_pgo"] = False
+
+        beta2 = torch.tensor(0.9)
+        with torch._dynamo.config.patch(**pinned):
+            for n, rows, cols in [(2, 128, 4096), (2, 64, 4096), (3, 96, 2048)]:
+                k = rows // 2
+                torch.manual_seed(5)
+                u = torch.randn(n, k, cols, device=DEVICE, dtype=torch.bfloat16)
+                v_full = torch.rand(n, rows, 1, device=DEVICE, dtype=torch.bfloat16)
+                indices = torch.stack(
+                    [torch.randperm(rows, device=DEVICE)[:k] for _ in range(n)], dim=0
+                )
+
+                u_out, v_out = nordion2_normalize_selected_stacked(
+                    u.clone(), v_full.clone(), indices, beta2
+                )
+
+                idx = indices.unsqueeze(-1)
+                v_sel = torch.gather(v_full, dim=-2, index=idx).float()
+                u_ref, v_sel_new = normuon_normalization_stacked(
+                    u.clone(), v_sel, beta2
+                )
+                v_ref = v_full.clone()
+                for i in range(n):
+                    v_ref[i].scatter_(
+                        dim=-2, index=idx[i], src=v_sel_new[i].to(v_ref.dtype)
+                    )
+
+                assert u_out.shape == u.shape
+                assert v_out.shape == v_full.shape
+                torch.testing.assert_close(u_out, u_ref, atol=1e-5, rtol=1e-5)
+                torch.testing.assert_close(v_out, v_ref, atol=1e-5, rtol=1e-5)
+
+    def test_multiple_shape_groups_step(self):
+        from dion import NorDion2
+
+        # End-to-end guard for #115. The unit test above covers the helper;
+        # this covers the path a user actually hits, where the megabatch drives
+        # it once per shape group and step() raised InductorError on the second.
+        # Same load-bearing shape constraints: >= 2 params per group and a
+        # column count large enough that the reduction is not persistent.
+        params = _make_params([(256, 2048)] * 2 + [(128, 2048)] * 2)
+        opt = NorDion2(params, lr=0.01)
+        for p in params:
+            p.grad = torch.randn_like(p)
+        opt.step()
+        for p in params:
+            assert torch.isfinite(p).all()
 
 # ---------------------------------------------------------------------------
 # Dion2

@@ -413,11 +413,12 @@ def nordion2_update_megabatch_async(
     )
 
     # Update variance neuron buffer for the selected rows and normalize the
-    # orthonormalized update. The gather of the selected variance rows, the
-    # NorMuon normalization (fp32 compute, V stored bf16), and the scatter of
-    # the updated rows back into the full buffer are fused into one compiled
-    # graph so the per-param Python scatter loop and the eager gather/normalize
-    # graph boundary collapse into a single launch per shape group.
+    # orthonormalized update. Stacking replaces the per-param Python loop with
+    # one launch per shape group: the gather of the selected variance rows plus
+    # the NorMuon normalization (fp32 compute, V stored bf16) are one compiled
+    # graph, and the scatter of the updated rows back into the full buffer is a
+    # second one -- deliberately not fused into the first, see
+    # nordion2_normalize_selected_stacked.
     V_local = to_local(V)
     U_stacked = torch.stack(U_ortho)
     V_stacked = torch.stack(V_local)
@@ -469,6 +470,25 @@ def nordion2_update_megabatch_async(
 
 
 @torch.compile(fullgraph=True)
+def _nordion2_gather_and_normalize(
+    U: Tensor,
+    V_full: Tensor,
+    idx: Tensor,
+    muon_beta2: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    V_sel = torch.gather(V_full, dim=-2, index=idx).float()
+    return normuon_normalization_stacked(U, V_sel, muon_beta2)
+
+
+@torch.compile(fullgraph=True)
+def _nordion2_scatter_variance(
+    V_full: Tensor,
+    idx: Tensor,
+    V_sel_new: Tensor,
+) -> Tensor:
+    return V_full.scatter(dim=-2, index=idx, src=V_sel_new.to(V_full.dtype))
+
+
 def nordion2_normalize_selected_stacked(
     U: Tensor,  # [N, k, cols]  orthogonalized selected rows
     V_full: Tensor,  # [N, rows, 1]  full per-neuron variance buffer (param dtype)
@@ -477,16 +497,37 @@ def nordion2_normalize_selected_stacked(
 ) -> Tuple[Tensor, Tensor]:
     """
     Gather the selected variance rows, run NorMuon normalization on them, and
-    scatter the updated rows back into the full variance buffer, all in one
-    compiled graph. Compute is done in fp32 (V stored in param dtype); the
-    returned V_full has the same dtype as the input.
+    scatter the updated rows back into the full variance buffer. Compute is done
+    in fp32 (V stored in param dtype); the returned V_full has the same dtype as
+    the input.
     Returns (normalized_U, updated_V_full).
+
+    The gather + reduction and the scatter are compiled as two graphs rather than
+    one. PyTorch 2.13's inductor miscompiles the single-graph form once automatic
+    dynamic shapes kick in: the scatter epilogue is emitted referencing a temp
+    defined only inside the preceding reduction loop body, and compilation dies
+    with ``NameError: tmp19 is not defined``. Reproducing it needs a shape group
+    of at least two parameters (dynamo specializes ``N == 1``, so a group holding
+    a single parameter stays on the static path) plus a second distinct
+    row/column shape to generalize on, and a reduction long enough not to be
+    compiled as a persistent kernel.
+
+    Splitting the scatter into its own graph makes that fusion unreachable while
+    keeping dynamic shapes (so this stays one compilation for all later shapes,
+    unlike ``dynamic=False``, which recompiles per shape and hits the recompile
+    limit). It also matters where the fused form does compile: on 2.13 its
+    generalized kernel is ~60x slower than the split one (68 ms vs 1.1 ms per
+    call at N=8, 8192x2048 on an H100), because fusing the scatter into the
+    dynamic reduction costs inductor the tiling it would otherwise pick.
+
+    This is unconditional rather than version-gated (unlike ``_inductor_workaround``
+    in dion2) so the update numerics do not depend on the torch version: the split
+    reassociates the fp32 reduction and is not bit-identical to the fused form.
+    See https://github.com/pytorch/pytorch/issues/194490 and #115.
     """
     idx = indices.unsqueeze(-1)
-    V_sel = torch.gather(V_full, dim=-2, index=idx).float()
-    U_normed, V_sel_new = normuon_normalization_stacked(U, V_sel, muon_beta2)
-    V_full = V_full.scatter(dim=-2, index=idx, src=V_sel_new.to(V_full.dtype))
-    return U_normed, V_full
+    U_normed, V_sel_new = _nordion2_gather_and_normalize(U, V_full, idx, muon_beta2)
+    return U_normed, _nordion2_scatter_variance(V_full, idx, V_sel_new)
 
 
 @torch.compile(fullgraph=True)
